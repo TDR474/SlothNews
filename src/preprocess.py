@@ -1,76 +1,49 @@
 from datetime import datetime, timedelta
-from google.cloud import bigquery
+import pandas as pd
+import gdelt
 import requests
 from bs4 import BeautifulSoup
 from langdetect import detect
 import sys
 
 
-def get_gdelt_event_id(url):
-    """Gets the GLOBALEVENTID for the given URL if it exists in GDELT."""
-    client = bigquery.Client()
+def get_event_articles(url, article_date, window=7):
+    """Gets related articles based on events' IDs.
+    Input article_date in format 'YYYY-MM-DD'."""
+    gd = gdelt.gdelt(version=2)
 
-    query = f"""
-    SELECT DISTINCT GLOBALEVENTID, SQLDATE
-    FROM `gdelt-bq.gdeltv2.events`
-    WHERE SOURCEURL = '{url}'
-    LIMIT 10
-    """
+    article_date = datetime.strptime(article_date, '%Y-%m-%d')
+    start_date = article_date - timedelta(days=window)
+    end_date = min(article_date + timedelta(days=window), datetime.now())
 
-    job = client.query(query)
-    results = list(job)
-    if not results:
-        return None, None
-    event_ids = [row['GLOBALEVENTID'] for row in results]
-    article_date = results[0]['SQLDATE']
-    return event_ids, article_date
+    all_mentions = gd.Search([start_date.strftime('%Y %b %d'), end_date.strftime('%Y %b %d')],
+                         table='mentions',
+                         output='pd',
+                         coverage=False)
 
+    input_mentions = all_mentions[all_mentions['MentionIdentifier'] == url]
 
-def get_event_articles(url, window=7):
-    """Gets articles in the same event as the URL within the specified
-    time window."""
-    client = bigquery.Client()
-
-    event_ids, article_date = get_gdelt_event_id(url)
-    if not event_ids:
+    if input_mentions.empty:
         return None
 
-    date = datetime.strptime(str(article_date), '%Y%m%d')
-    start_date = date - timedelta(days=window)
-    end_date = min(date + timedelta(days=window), datetime.now())
+    event_ids = input_mentions['GLOBALEVENTID'].unique()
 
-    ids_string = ", ".join(map(str, event_ids))
-    # TODO: ensure the CAST on date works as expected
-    article_query = f"""
-    SELECT
-        GLOBALEVENTID,
-        SOURCEURL,
-        SQLDATE,
-        Actor1Name,
-        Actor1CountryCode,
-        Actor2Name,
-        Actor2CountryCode,
-        ActionGeo_Type,
-        ActionGeo_FullName,
-        ActionGeo_CountryCode,
-        CAST(AvgTone AS FLOAT64) AS AvgTone,
-        CAST(GoldsteinScale AS FLOAT64) AS GoldsteinScale,
-        NumArticles
-    FROM `gdelt-bq.gdeltv2.events`
-    WHERE GLOBALEVENTID IN ({ids_string}) AND SOURCEURL IS NOT NULL
-    AND CAST(SQLDATE AS STRING) BETWEEN '{start_date.strftime('%Y%m%d')}' AND '{end_date.strftime('%Y%m%d')}'
-    """
+    related_mentions = all_mentions[all_mentions['GLOBALEVENTID'].isin(event_ids)]
 
-    article_job = client.query(article_query)
-    results = [dict(row) for row in article_job]
+    related_mentions = related_mentions.drop_duplicates(subset='MentionIdentifier')
 
-    for result in results:
+    results_list = related_mentions.to_dict('records')
+
+    for result in results_list:
         result['ArticleContent'] = None
         result['ArticleLanguage'] = None
+        result['SOURCEURL'] = result.pop('MentionIdentifier', None)
 
-    return results
+    return results_list
 
 
+# TODO: move limit to get_event_articles
+# TODO: utilize max_len within scraping if possible
 def scrape_detect_lang(articles, limit=50, max_len=10000):
     """Scrapes the articles' content and determines language."""
     headers = {
@@ -102,17 +75,17 @@ def scrape_detect_lang(articles, limit=50, max_len=10000):
                   file=sys.stderr)
 
 
-def preprocess_articles(url, window=7, limit=50, max_len=10000):
+def preprocess_articles(url, article_date, window=7, limit=50, max_len=10000):
     """Get preprocessed articles for the given url.
     window=7 is the time window (radius).
     limit=50 is the limit for number of articles.
     max_len=10000 is the limit for length of each article before truncating."""
-    articles = get_event_articles(url, window)
+    articles = get_event_articles(url, article_date, window)
 
     if not articles:
         return []
 
     scrape_detect_lang(articles, limit, max_len)
 
-    return [article for article in articles if article['ArticleContent']]
-
+    return list({article['ArticleContent']: article for article in articles if
+                 article['ArticleContent']}.values())
